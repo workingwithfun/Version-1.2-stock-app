@@ -1,0 +1,3060 @@
+
+import traceback
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+
+from .management.commands.import_logic import parse_balance_file
+from .models import GrowthSummary
+from .models import StockAnalysis
+
+from django.views.decorators.http import require_GET 
+from balance.models import BalanceSheetEntry
+from django.utils.dateparse import parse_date
+import pandas as pd
+from .models import Summary
+
+from django.contrib import messages
+from django.db import transaction
+import math
+from statistics import median, mean
+from django.shortcuts import render, redirect
+import csv
+import os
+from .screener_downloader import download_for_symbols
+from .models import BalanceSheetStats, CompanySymbol, MetricSummary, ScreenerDownloadLog, ValueAnalysis10Y, ValueAnalysis5Y
+from django.views.decorators.http import require_POST
+from django.conf import settings
+import threading
+import numpy as np
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+from rest_framework import status
+import datetime as dt
+
+import tempfile
+# Create your views here.
+# balance/views.py
+from django.shortcuts import render
+from .models import BalanceSheetEntry,MCAPData
+from rest_framework.pagination import PageNumberPagination
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from balance.models import BalanceSheetEntry, BalanceSheetYearValue, CompanySymbol
+
+
+
+from balance import models
+class LargeResultsSetPagination(PageNumberPagination):
+    page_size = 50  # or 200
+    page_size_query_param = "page_size"
+    max_page_size = 100
+YEARS = list(range(2016, 2025))   # use these as table columns (Mar-2016 .. Mar-2024)
+
+def balance_list(request):
+    q_type = request.GET.get('type', '')   # empty => all
+    entries = BalanceSheetEntry.objects.all().order_by('file_name')
+    if q_type:
+        entries = entries.filter(type=q_type)
+    types = [c[0] for c in BalanceSheetEntry.TYPE_CHOICES]
+    return render(request, 'balance/balance_list.html', {
+        'entries': entries,
+        'types': types,
+        'years': YEARS,
+        'selected_type': q_type,
+    })
+
+from rest_framework import viewsets
+from balance.models import BalanceSheetEntry
+from balance.serializers import BalanceSheetEntrySerializer
+
+from django.db.models import Prefetch
+from rest_framework.pagination import PageNumberPagination
+
+from django.db.models import Prefetch, Q
+from rest_framework import viewsets
+from rest_framework.pagination import PageNumberPagination
+
+from .models import BalanceSheetEntry, BalanceSheetYearValue
+from .serializers import BalanceSheetEntrySerializer
+
+
+class InfiniteScrollPagination(PageNumberPagination):
+    page_size = 100
+
+
+class BalanceSheetEntryViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = BalanceSheetEntrySerializer
+    pagination_class = InfiniteScrollPagination
+
+
+    def get_queryset(self):
+        from django.db.models import Prefetch, Q
+    
+        year_qs = BalanceSheetYearValue.objects.only(
+            "entry_id", "year", "value"
+        ).order_by("year")
+    
+        qs = (
+            BalanceSheetEntry.objects
+            .select_related("company")
+            .prefetch_related(
+                Prefetch("year_values", queryset=year_qs)
+            )
+            .only(
+                "id",
+                "company",
+                "company__name",
+                "company__company_name",
+                "company__symbol",
+                "file_name",
+                "type",
+                "trailing",
+                "audit_date",
+                "created_at",
+            )
+        )
+    
+        metric_type = self.request.query_params.get("type")
+        if metric_type:
+            qs = qs.filter(type=metric_type)
+    
+        search_term = self.request.query_params.get("search", "").strip()
+    
+        if search_term:
+            qs = qs.filter(
+                Q(company__name__icontains=search_term)
+                | Q(company__company_name__icontains=search_term)
+                | Q(company__symbol__icontains=search_term)
+                | Q(file_name__icontains=search_term)
+            )
+    
+        return qs.order_by("company_id", "type")
+    
+from rest_framework.decorators import api_view
+from django.http import JsonResponse
+from balance.models import BalanceSheetEntry, BalanceSheetYearValue, CompanySymbol
+
+import pandas as pd
+import os
+
+# ---------- Main API ----------
+import logging
+from rest_framework.decorators import api_view
+from django.http import JsonResponse
+from balance.models import BalanceSheetEntry, BalanceSheetYearValue, CompanySymbol
+import pandas as pd
+import datetime
+
+from django.db import transaction
+from rest_framework.views import APIView
+from rest_framework.response import Response
+
+from .models import (
+    CompanySymbol,
+    BalanceSheetEntry,
+    BalanceSheetYearValue
+)
+
+
+
+NARRATION_MAP = {
+    "sales": "Sales",
+    "revenue": "Sales",
+
+    "operating profit margin": "OPM",
+    "opm": "OPM",
+
+    "eps": "EPS",
+
+    "return on capital employed": "ROCE",
+    "roce": "ROCE",
+
+    "return on equity": "ROE",
+    "roe": "ROE",
+
+    "net profit": "Net profit",
+    "profit after tax": "Net profit",
+}
+
+from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse
+import tempfile, os, datetime
+
+from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse
+import tempfile, os, datetime
+
+import os
+import datetime
+import tempfile
+from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse
+
+
+import datetime
+import logging
+
+from django.db import transaction
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+
+logger = logging.getLogger(__name__)
+
+BATCH_SIZE = 50
+
+
+@csrf_exempt
+def upload_balance_file(request):
+    print("========== UPLOAD STARTED ==========", flush=True)
+
+    if request.method != "POST":
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "Invalid request method",
+            },
+            status=405,
+        )
+
+    files = request.FILES.getlist("files")
+
+    if not files:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "No files uploaded",
+            },
+            status=400,
+        )
+
+    timestamps = request.POST.getlist("lastModified[]")
+    today = datetime.date.today()
+
+    total_inserted = 0
+    successful_files = 0
+    errors = []
+
+    for index, uploaded_file in enumerate(files, start=0):
+        try:
+            # Determine the audit date for this file.
+            audit_date = today
+
+            if index < len(timestamps) and timestamps[index]:
+                try:
+                    timestamp_ms = int(timestamps[index])
+                    audit_date = datetime.datetime.fromtimestamp(
+                        timestamp_ms / 1000
+                    ).date()
+                except (ValueError, TypeError, OverflowError, OSError):
+                    logger.warning(
+                        "Invalid timestamp for %s; using today's date.",
+                        uploaded_file.name,
+                    )
+
+            # parse_balance_file already manages its transaction.
+            inserted = parse_balance_file(
+                uploaded_file,
+                uploaded_file.name,
+                audit_date,
+            )
+
+            total_inserted += inserted or 0
+            successful_files += 1
+
+        except Exception as exc:
+            logger.exception(
+                "Failed to import balance file: %s",
+                uploaded_file.name,
+            )
+
+            errors.append({
+                "file": uploaded_file.name,
+                "error": str(exc),
+            })
+
+        # Log progress periodically rather than printing every row.
+        if (index + 1) % 50 == 0 or index + 1 == len(files):
+            print(
+                f"========== PROGRESS: {index + 1}/{len(files)} files; "
+                f"successful={successful_files}; failed={len(errors)} "
+                f"==========",
+                flush=True,
+            )
+
+    if errors:
+        status = "partial_success" if successful_files else "error"
+    else:
+        status = "success"
+
+    return JsonResponse(
+        {
+            "status": status,
+            "total_files": len(files),
+            "successful_files": successful_files,
+            "failed_files": len(errors),
+            "inserted": total_inserted,
+            "errors": errors,
+        },
+        status=200,
+    )
+
+
+
+# Define the upload form here (no forms.py needed)
+import io
+import datetime   # class
+from django.db.models import Q
+from .models import ErrorLog, Equity
+from django.db.models import OuterRef, Exists
+import csv
+import datetime
+import io
+import logging
+
+from django.db import transaction
+from django.db.models import Exists, OuterRef
+from django.http import JsonResponse
+
+@csrf_exempt
+
+@transaction.atomic
+def import_equity_l(request):
+    def safe_parse_date(date_str):
+        if not date_str:
+            return None
+
+        date_str = date_str.strip()
+        
+        for fmt in ("%d-%b-%y", "%d-%b-%Y", "%Y-%m-%d"):
+            try:
+                return datetime.datetime.strptime(date_str, fmt).date()
+            except ValueError:
+                continue
+
+        return None
+
+    if request.method != "POST":
+        return JsonResponse(
+            {"error": "Invalid request method"},
+            status=405,
+        )
+
+    csv_file = request.FILES.get("file")
+
+    if not csv_file:
+        return JsonResponse({"error": "No file uploaded"}, status=400)
+
+    if not csv_file.name.lower().endswith(".csv"):
+        return JsonResponse(
+            {"error": "Only .csv files are supported"},
+            status=400,
+        )
+
+    BATCH_SIZE = 1000
+    SOURCE = "Post Equity Reconciliation"
+    created_count = 0
+    updated_count = 0
+    try:
+        # Stream CSV parsing instead of creating a second full-file string.
+        text_file = io.TextIOWrapper(
+            csv_file,
+            encoding="utf-8-sig",
+            newline="",
+        )
+
+        reader = csv.DictReader(text_file)
+
+        if not reader.fieldnames:
+            return JsonResponse(
+                {"error": "CSV file is empty or has no header"},
+                status=400,
+            )
+
+        reader.fieldnames = [
+            (header or "").strip().lower()
+            for header in reader.fieldnames
+        ]
+
+        required_fields = [
+            "symbol",
+            "name of company",
+            "series",
+            "date of listing",
+            "isin number",
+        ]
+
+        for field in required_fields:
+            if field not in reader.fieldnames:
+                return JsonResponse(
+                    {"error": f"Missing column in CSV: {field}"},
+                    status=400,
+                )
+
+        # Cache CompanySymbol records once instead of querying per CSV row.
+        company_ids = {
+            symbol.strip().upper(): company_id
+            for symbol, company_id in CompanySymbol.objects.values_list(
+                "symbol", "id"
+            )
+            if symbol
+        }
+
+        # Use ISIN as the upsert key. If a CSV contains duplicate ISINs,
+        # retain the last valid row, matching the original loop's behavior.
+        records_by_isin = {}
+        skipped = 0
+        valid_rows = 0
+
+        for row in reader:
+            try:
+                row = {
+                    (key or "").strip().lower(): (value or "").strip()
+                    for key, value in row.items()
+                    if key is not None
+                }
+
+                symbol = row["symbol"].upper()
+                name = row["name of company"]
+                series = row["series"]
+                listing_date_text = row["date of listing"]
+                isin = row["isin number"]
+
+                listing_date = safe_parse_date(listing_date_text)
+
+                if not listing_date:
+                    raise ValueError(
+                        f"Invalid date format: {listing_date_text}"
+                    )
+
+                records_by_isin[isin] = {
+                    "company_id": company_ids.get(symbol),
+                    "equity_symbol": symbol,
+                    "name_of_company": name,
+                    "series": series,
+                    "date_of_listing": listing_date,
+                    "isin_number": isin,
+                }
+
+                valid_rows += 1
+
+            except (KeyError, TypeError, ValueError) as exc:
+                skipped += 1
+                logger.warning(
+                    "Skipped Equity L CSV row %s: %s",
+                    reader.line_num,
+                    exc,
+                )
+
+        # Bulk upsert in batches.
+        records = list(records_by_isin.values())
+
+        for start in range(0, len(records), BATCH_SIZE):
+            batch = records[start : start + BATCH_SIZE]
+            isins = [record["isin_number"] for record in batch]
+
+            existing_equities = {
+                equity.isin_number: equity
+                for equity in Equity.objects.filter(
+                    isin_number__in=isins
+                )
+            }
+
+            to_create = []
+            to_update = []
+
+            for record in batch:
+                equity = existing_equities.get(record["isin_number"])
+
+                if equity is None:
+                    to_create.append(
+                        Equity(
+                            company_id=record["company_id"],
+                            equity_symbol=record["equity_symbol"],
+                            name_of_company=record["name_of_company"],
+                            series=record["series"],
+                            date_of_listing=record["date_of_listing"],
+                            isin_number=record["isin_number"],
+                        )
+                    )
+                else:
+                    equity.company_id = record["company_id"]
+                    equity.equity_symbol = record["equity_symbol"]
+                    equity.name_of_company = record["name_of_company"]
+                    equity.series = record["series"]
+                    equity.date_of_listing = record["date_of_listing"]
+                    to_update.append(equity)
+
+            if to_create:
+                Equity.objects.bulk_create(to_create, batch_size=BATCH_SIZE)
+                created_count += len(to_create)
+            
+            if to_update:
+                Equity.objects.bulk_update(
+                    to_update,
+                    fields=[
+                        "company",
+                        "equity_symbol",
+                        "name_of_company",
+                        "series",
+                        "date_of_listing",
+                    ],
+                    batch_size=BATCH_SIZE,
+                )
+                updated_count += len(to_update)
+
+
+        # Reconciliation 1: equities without a matching CompanySymbol.
+        missing_company_symbols = list(
+            Equity.objects.filter(company__isnull=True).values_list(
+                "equity_symbol",
+                "name_of_company",
+            )
+        )
+
+        # Reconciliation 2: CompanySymbol records without an Equity.
+        missing_equities = list(
+            CompanySymbol.objects.annotate(
+                has_equity=Exists(
+                    Equity.objects.filter(
+                        equity_symbol=OuterRef("symbol")
+                    )
+                )
+            )
+            .filter(has_equity=False)
+            .values_list("symbol", "company_name")
+        )
+
+        # Fetch existing reconciliation logs once, rather than calling
+        # get_or_create for every missing record.
+        existing_logs = set(
+            ErrorLog.objects.filter(
+                error_type__in=[
+                    "MISSING_COMPANY_SYMBOL",
+                    "MISSING_EQUITY",
+                ],
+                source=SOURCE,
+            ).values_list(
+                "error_type",
+                "equity_symbol",
+                "company_name",
+            )
+        )
+
+        logs_to_create = []
+
+        for symbol, name in missing_company_symbols:
+            key = ("MISSING_COMPANY_SYMBOL", symbol, name)
+
+            if key not in existing_logs:
+                logs_to_create.append(
+                    ErrorLog(
+                        error_type=key[0],
+                        equity_symbol=symbol,
+                        company_name=name,
+                        source=SOURCE,
+                    )
+                )
+                existing_logs.add(key)
+
+        for symbol, name in missing_equities:
+            key = ("MISSING_EQUITY", symbol, name)
+
+            if key not in existing_logs:
+                logs_to_create.append(
+                    ErrorLog(
+                        error_type=key[0],
+                        equity_symbol=symbol,
+                        company_name=name,
+                        source=SOURCE,
+                    )
+                )
+                existing_logs.add(key)
+
+        if logs_to_create:
+            ErrorLog.objects.bulk_create(
+                logs_to_create,
+                batch_size=BATCH_SIZE,
+                ignore_conflicts=True,
+            )
+
+        return JsonResponse({
+            "success": f"{valid_rows} equities imported successfully!",
+            "created": created_count,
+            "updated": updated_count,
+            "skipped": skipped,
+            "total": valid_rows,
+            "missing_company_symbol_logged": len(missing_company_symbols),
+            "missing_equity_logged": len(missing_equities),
+        })
+
+    except Exception as exc:
+        logger.exception("Equity L import failed")
+        return JsonResponse(
+            {"error": f"Import failed: {str(exc)}"},
+            status=500,
+        )
+
+
+def equities_list(request):
+    equities = Equity.objects.all().values(
+        "id", "name_of_company", "symbol", "series", "date_of_listing", "isin_number"
+    )
+    return JsonResponse(list(equities), safe=False)
+
+from .models import CompanySymbol, MCAPData
+
+import csv
+import io
+import logging
+import statistics
+
+from django.db import transaction
+from django.http import JsonResponse
+from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+
+logger = logging.getLogger(__name__)
+
+
+@csrf_exempt
+@transaction.atomic
+def import_mcap_csv(request):
+    BATCH_SIZE = 1000
+    SOURCE = "MCAP Import"
+
+    def parse_float(value):
+        try:
+            value = str(value or "").replace(",", "").strip()
+            return float(value) if value else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def parse_int(value):
+        try:
+            value = str(value or "").replace(",", "").strip()
+            return int(float(value)) if value else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def normalize_industry(value):
+        return " ".join((value or "").casefold().split())
+
+    def log_errors_bulk(errors):
+        errors = {
+            (error_type, symbol, name)
+            for error_type, symbol, name in errors
+            if symbol
+        }
+
+        if not errors:
+            return
+
+        symbols = {symbol for _, symbol, _ in errors}
+
+        existing = set(
+            ErrorLog.objects.filter(
+                source=SOURCE,
+                equity_symbol__in=symbols,
+            ).values_list(
+                "error_type",
+                "equity_symbol",
+                "company_name",
+            )
+        )
+
+        new_logs = []
+
+        for error_type, symbol, name in errors:
+            key = (error_type, symbol, name)
+
+            if key not in existing:
+                new_logs.append(
+                    ErrorLog(
+                        error_type=error_type,
+                        equity_symbol=symbol,
+                        company_name=name,
+                        source=SOURCE,
+                    )
+                )
+                existing.add(key)
+
+        if new_logs:
+            ErrorLog.objects.bulk_create(
+                new_logs,
+                batch_size=BATCH_SIZE,
+                ignore_conflicts=True,
+            )
+
+    if request.method != "POST":
+        return JsonResponse(
+            {"error": "Invalid request method"},
+            status=405,
+        )
+
+    csv_file = request.FILES.get("file")
+
+    if not csv_file:
+        return JsonResponse(
+            {"error": "No file uploaded"},
+            status=400,
+        )
+
+    if not csv_file.name.lower().endswith(".csv"):
+        return JsonResponse(
+            {"error": "Only .csv files are supported"},
+            status=400,
+        )
+
+    try:
+        # --------------------------------------------------
+        # 1. READ AND VALIDATE CSV
+        # --------------------------------------------------
+        text_file = io.TextIOWrapper(
+            csv_file,
+            encoding="utf-8-sig",
+            newline="",
+        )
+
+        reader = csv.DictReader(text_file)
+
+        if not reader.fieldnames:
+            return JsonResponse(
+                {"error": "CSV file is empty or has no header"},
+                status=400,
+            )
+
+        reader.fieldnames = [
+            (field or "").strip().lower()
+            for field in reader.fieldnames
+        ]
+
+        required_fields = [
+            "symbol",
+            "issue size",
+            "close price/paid up value(rs.)",
+            "market cap(rs.)",
+        ]
+
+        for field in required_fields:
+            if field not in reader.fieldnames:
+                return JsonResponse(
+                    {"error": f"Missing column in CSV: {field}"},
+                    status=400,
+                )
+
+        # Keep the last CSV row for each symbol.
+        rows_by_symbol = {}
+        skipped = 0
+
+        for raw_row in reader:
+            row = {
+                (key or "").strip().lower(): (value or "").strip()
+                for key, value in raw_row.items()
+                if key is not None
+            }
+
+            symbol = row.get("symbol", "").strip().upper()
+
+            if not symbol:
+                skipped += 1
+                continue
+
+            rows_by_symbol[symbol] = {
+                "issue_size": parse_int(row.get("issue size")),
+                "share_price": parse_float(
+                    row.get("close price/paid up value(rs.)")
+                ),
+                "market_cap": parse_int(row.get("market cap(rs.)")),
+            }
+
+        if not rows_by_symbol:
+            return JsonResponse({
+                "status": "success",
+                "imported_records": 0,
+                "skipped_records": skipped,
+                "message": "No valid company symbols found.",
+            })
+
+        symbols = list(rows_by_symbol.keys())
+
+        # --------------------------------------------------
+        # 2. MATCH COMPANIES
+        # --------------------------------------------------
+        company_map = {
+            company.symbol.upper(): company
+            for company in CompanySymbol.objects.filter(
+                symbol__in=symbols
+            )
+        }
+
+        # Resolve symbols case-insensitively if needed.
+        unresolved = set(symbols) - set(company_map)
+
+        if unresolved:
+            for company in CompanySymbol.objects.all().only(
+                "id", "symbol", "name", "company_name",
+                "industry", "sector", "sub_sector_1", "sub_sector_2",
+            ):
+                upper_symbol = company.symbol.upper()
+
+                if upper_symbol in unresolved:
+                    company_map[upper_symbol] = company
+
+        errors_to_log = []
+        valid_rows = []
+
+        for symbol, row in rows_by_symbol.items():
+            company = company_map.get(symbol)
+
+            if company is None:
+                errors_to_log.append((
+                    "MISSING_COMPANY_SYMBOL",
+                    symbol,
+                    None,
+                ))
+                skipped += 1
+                continue
+
+            valid_rows.append((company, row))
+
+        if not valid_rows:
+            log_errors_bulk(errors_to_log)
+
+            return JsonResponse({
+                "status": "success",
+                "imported_records": 0,
+                "skipped_records": skipped,
+                "message": "No CSV symbols matched CompanySymbol records.",
+            })
+
+        company_ids = [company.pk for company, _ in valid_rows]
+
+        # --------------------------------------------------
+        # 3. CREATE OR UPDATE MCAP VALUES
+        # --------------------------------------------------
+        existing_mcap = {
+            obj.company_id: obj
+            for obj in MCAPData.objects.filter(
+                company_id__in=company_ids
+            )
+        }
+
+        to_create = []
+        to_update = []
+
+        for company, row in valid_rows:
+            obj = existing_mcap.get(company.pk)
+
+            if obj is None:
+                to_create.append(
+                    MCAPData(
+                        company=company,
+                        issue_size=row["issue_size"],
+                        share_price=row["share_price"],
+                        market_cap=row["market_cap"],
+                    )
+                )
+            else:
+                obj.issue_size = row["issue_size"]
+                obj.share_price = row["share_price"]
+                obj.market_cap = row["market_cap"]
+                to_update.append(obj)
+
+        if to_create:
+            MCAPData.objects.bulk_create(
+                to_create,
+                batch_size=BATCH_SIZE,
+            )
+
+        if to_update:
+            MCAPData.objects.bulk_update(
+                to_update,
+                fields=[
+                    "issue_size",
+                    "share_price",
+                    "market_cap",
+                ],
+                batch_size=BATCH_SIZE,
+            )
+
+        imported_count = len(to_create) + len(to_update)
+
+        # --------------------------------------------------
+        # 4. LOAD EPS ENTRIES AND MCAP RECORDS
+        # --------------------------------------------------
+        eps_entries = list(
+            BalanceSheetEntry.objects
+            .filter(type="EPS")
+            .prefetch_related("year_values")
+        )
+        
+        # One EPS entry per CompanySymbol ID.
+        eps_by_company_id = {}
+        
+        for entry in eps_entries:
+            if entry.company_id is not None:
+                eps_by_company_id.setdefault(entry.company_id, entry)
+
+        imported_objects = list(
+            MCAPData.objects.filter(
+                company_id__in=company_ids
+            ).select_related("company")
+        )
+
+        today = timezone.localdate()
+
+        fields_to_refresh = [
+            "stock_pe",
+            "ttm_pe",
+            "eps_y24",
+            "eps_trailing",
+            "industry_name",
+            "company_size",
+            "last_updated",
+        ]
+
+        # --------------------------------------------------
+        # 5. CALCULATE STOCK P/E AND TTM P/E
+        # --------------------------------------------------
+        for obj in imported_objects:
+            try:
+                obj.refresh_pe_values(
+                    skip_industry=True,
+                    save=False,
+                    eps_entries=eps_entries,
+                    eps_by_company_id=eps_by_company_id
+                )
+
+                obj.company_size = obj.compute_company_size()
+                obj.last_updated = today
+
+                if not obj.industry_name or not obj.industry_name.strip():
+                    obj.industry_name = (
+                        obj.company.industry.strip()
+                        if obj.company.industry
+                        and obj.company.industry.strip()
+                        else None
+                    )
+
+                if obj.stock_pe is None:
+                    errors_to_log.append((
+                        "NULL_STOCK_PE",
+                        obj.company.symbol,
+                        obj.company.company_name or obj.company.name,
+                    ))
+
+                if obj.ttm_pe is None:
+                    errors_to_log.append((
+                        "NULL_TTM_PE",
+                        obj.company.symbol,
+                        obj.company.company_name or obj.company.name,
+                    ))
+
+            except Exception:
+                logger.exception(
+                    "P/E calculation failed for %s",
+                    obj.company.symbol,
+                )
+
+                errors_to_log.append((
+                    "PE_CALCULATION_FAILED",
+                    obj.company.symbol,
+                    obj.company.company_name or obj.company.name,
+                ))
+
+        if imported_objects:
+            MCAPData.objects.bulk_update(
+                imported_objects,
+                fields=fields_to_refresh,
+                batch_size=BATCH_SIZE,
+            )
+
+        # --------------------------------------------------
+        # 6. CALCULATE INDUSTRY P/E
+        # Median of valid TTM P/E values within each industry.
+        # Includes both imported and previously stored companies.
+        # --------------------------------------------------
+        all_mcap_rows = list(
+            MCAPData.objects.select_related("company").only(
+                "id",
+                "ttm_pe",
+                "industry_pe",
+                "company__industry",
+                "company__symbol",
+                "company__name",
+                "company__company_name",
+            )
+        )
+
+        industry_values = {}
+
+        for obj in all_mcap_rows:
+            industry = normalize_industry(obj.company.industry)
+
+            if not industry or obj.ttm_pe is None:
+                continue
+
+            try:
+                pe = float(obj.ttm_pe)
+            except (TypeError, ValueError):
+                continue
+
+            if pe != pe or pe in (float("inf"), float("-inf")):
+                continue
+
+            industry_values.setdefault(industry, []).append(pe)
+
+        industry_medians = {
+            industry: round(statistics.median(values), 2)
+            for industry, values in industry_values.items()
+            if values
+        }
+
+        industry_updates = []
+
+        for obj in all_mcap_rows:
+            industry = normalize_industry(obj.company.industry)
+            median_pe = industry_medians.get(industry)
+
+            # Also clear old values when there is no usable median.
+            obj.industry_pe = median_pe
+            industry_updates.append(obj)
+
+            if median_pe is None:
+                errors_to_log.append((
+                    "NULL_INDUSTRY_PE",
+                    obj.company.symbol,
+                    obj.company.company_name or obj.company.name,
+                ))
+
+        if industry_updates:
+            MCAPData.objects.bulk_update(
+                industry_updates,
+                fields=["industry_pe"],
+                batch_size=BATCH_SIZE,
+            )
+
+        # --------------------------------------------------
+        # 7. LOG ERRORS
+        # --------------------------------------------------
+        log_errors_bulk(errors_to_log)
+
+        # --------------------------------------------------
+        # 8. RETURN IMPORT SUMMARY
+        # --------------------------------------------------
+        refreshed = MCAPData.objects.filter(
+            company_id__in=company_ids
+        )
+
+        return JsonResponse({
+            "status": "success",
+            "imported_records": imported_count,
+            "skipped_records": skipped,
+            "refreshed_records": refreshed.count(),
+            "records_with_stock_pe": refreshed.filter(
+                stock_pe__isnull=False
+            ).count(),
+            "records_with_ttm_pe": refreshed.filter(
+                ttm_pe__isnull=False
+            ).count(),
+            "records_with_industry_pe": refreshed.filter(
+                industry_pe__isnull=False
+            ).count(),
+            "errors_logged": ErrorLog.objects.filter(
+                source=SOURCE
+            ).count(),
+        })
+
+    except Exception as exc:
+        logger.exception("MCAP CSV import failed")
+
+        return JsonResponse(
+            {"error": f"Import failed: {str(exc)}"},
+            status=500,
+        )  
+# ------------------ Helper ------------------
+def compute_company_size(market_cap_inr):
+    LARGE_CAP = 50000 * 10_000_000
+    MID_CAP_MIN = 10000 * 10_000_000
+    if market_cap_inr > LARGE_CAP:
+        return "Large Cap - >50,000 CR"
+    elif market_cap_inr >= MID_CAP_MIN:
+        return "Mid Cap - 10,000 to 50,000 CR"
+    else:
+        return "Small Cap - <10,000 CR"
+
+from django.http import JsonResponse
+from .models import Equity, MCAPData
+
+from django.http import JsonResponse
+from .models import Equity, MCAPData
+
+
+def equities_with_mcap(request):
+    equities = Equity.objects.select_related("company").all()
+
+    mcap_records = MCAPData.objects.select_related("company").all()
+
+    # Normalize symbols to avoid case and whitespace mismatches.
+    mcap_dict = {
+        m.company.symbol.strip().upper(): m
+        for m in mcap_records
+        if m.company and m.company.symbol
+    }
+
+    combined = []
+
+    for eq in equities:
+        company = eq.company
+        symbol = (
+            company.symbol.strip().upper()
+            if company and company.symbol
+            else None
+        )
+
+        mcap = mcap_dict.get(symbol) if symbol else None
+
+        company_industry = (
+            company.industry if company else None
+        )
+
+        combined.append({
+            "id": eq.id,
+            "name_of_company": eq.name_of_company,
+            "symbol": symbol,
+            "series": eq.series,
+            "date_of_listing": eq.date_of_listing,
+            "isin_number": eq.isin_number,
+            "mcap": {
+                "issue_size": mcap.issue_size,
+                "share_price": mcap.share_price,
+                "market_cap": mcap.market_cap,
+                "stock_pe": mcap.stock_pe,
+                "ttm_pe": mcap.ttm_pe,
+                "industry_pe": mcap.industry_pe,
+                "eps_y24": mcap.eps_y24,
+                "eps_trailing": mcap.eps_trailing,
+                "industry_name": (
+                    mcap.industry_name or company_industry
+                ),
+                "nifty_index": mcap.nifty_index,
+                "company_name": company.name if company else None,
+                "company_full_name": (
+                    company.company_name if company else None
+                ),
+                "sector": company.sector if company else None,
+                "sub_sector_1": (
+                    company.sub_sector_1 if company else None
+                ),
+                "sub_sector_2": (
+                    company.sub_sector_2 if company else None
+                ),
+                "industry": company_industry,
+                "company_size": mcap.company_size,
+            } if mcap else None,
+            "mcap_found": mcap is not None,
+        })
+
+    return JsonResponse(combined, safe=False)
+
+import pandas as pd
+import io
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from .utils import move_and_replace_file
+from .models import CompanySymbol  # adjust import if needed
+from django.db import transaction, connection
+
+
+import logging
+import pandas as pd
+
+from django.db import transaction
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
+
+from .models import CompanySymbol
+
+logger = logging.getLogger(__name__)
+
+BATCH_SIZE = 1000
+
+REQUIRED_FIELDS = [
+    "screener file name",
+    "symbol",
+    "name of company",
+]
+
+OPTIONAL_FIELDS = {
+    "sector": "sector",
+    "sub sector 1": "sub_sector_1",
+    "sub sector 2": "sub_sector_2",
+    "industry": "industry",
+}
+
+UPDATE_FIELDS = [
+    "name",
+    "company_name",
+    "sector",
+    "sub_sector_1",
+    "sub_sector_2",
+    "industry",
+]
+
+
+def clean_cell(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+@csrf_exempt
+@require_POST
+def import_mapping(request):
+    excel_file = request.FILES.get("file")
+
+    if not excel_file:
+        return JsonResponse({"error": "No file uploaded"}, status=400)
+
+    if not excel_file.name.lower().endswith((".xlsx", ".xls")):
+        return JsonResponse(
+            {"error": "Only Excel files (.xlsx, .xls) are supported"},
+            status=400,
+        )
+
+    try:
+        df = pd.read_excel(
+            excel_file,
+            sheet_name="Sheet1",
+            dtype=str,
+        )
+
+        df.columns = [
+            str(col).strip().lower().replace("_", " ").replace("-", " ")
+            for col in df.columns
+        ]
+
+        # Detect duplicate column names after normalization.
+        if df.columns.duplicated().any():
+            duplicates = df.columns[df.columns.duplicated()].tolist()
+            return JsonResponse(
+                {
+                    "error": "Duplicate columns after normalization",
+                    "columns": duplicates,
+                },
+                status=400,
+            )
+
+        missing_fields = [
+            field for field in REQUIRED_FIELDS if field not in df.columns
+        ]
+
+        if missing_fields:
+            return JsonResponse(
+                {
+                    "error": "Missing required Excel columns",
+                    "missing_columns": missing_fields,
+                },
+                status=400,
+            )
+
+        columns_to_read = REQUIRED_FIELDS + [
+            field for field in OPTIONAL_FIELDS if field in df.columns
+        ]
+
+        records_by_symbol = {}
+        invalid_rows = []
+        duplicate_symbols = []
+
+        for idx, row in enumerate(
+            df[columns_to_read].to_dict(orient="records"),
+            start=2,
+        ):
+            screener_name = clean_cell(row.get("screener file name"))
+            company_name = clean_cell(row.get("name of company"))
+            symbol = clean_cell(row.get("symbol"))
+
+            missing = []
+            if not screener_name:
+                missing.append("screener file name")
+            if not company_name:
+                missing.append("name of company")
+            if not symbol:
+                missing.append("symbol")
+
+            if missing:
+                invalid_rows.append({
+                    "excel_row": idx,
+                    "reason": "Missing required fields",
+                    "missing_fields": missing,
+                    "data": {
+                        "screener_file_name": screener_name,
+                        "company_name": company_name,
+                        "symbol": symbol,
+                    },
+                })
+                continue
+
+            data = {
+                "symbol": symbol,
+                "name": screener_name,
+                "company_name": company_name,
+            }
+
+            for excel_col, model_field in OPTIONAL_FIELDS.items():
+                if excel_col in df.columns:
+                    value = clean_cell(row.get(excel_col))
+                    if value:
+                        data[model_field] = value
+
+            if symbol in records_by_symbol:
+                duplicate_symbols.append({
+                    "excel_row": idx,
+                    "symbol": symbol,
+                    "reason": "Duplicate symbol; last valid row will be used",
+                })
+
+            records_by_symbol[symbol] = data
+
+        created_count = 0
+        updated_count = 0
+
+        # All database writes succeed together or roll back together.
+        with transaction.atomic():
+            records = list(records_by_symbol.values())
+
+            for start in range(0, len(records), BATCH_SIZE):
+                batch = records[start:start + BATCH_SIZE]
+                symbols = [item["symbol"] for item in batch]
+
+                existing_records = CompanySymbol.objects.in_bulk(
+                    symbols,
+                    field_name="symbol",
+                )
+
+                to_create = []
+                to_update = []
+
+                for data in batch:
+                    existing = existing_records.get(data["symbol"])
+
+                    if existing is None:
+                        create_data = {
+                            field: data.get(field, "")
+                            for field in UPDATE_FIELDS
+                        }
+                        create_data["symbol"] = data["symbol"]
+                        to_create.append(CompanySymbol(**create_data))
+                    else:
+                        for field in UPDATE_FIELDS:
+                            if field in data:
+                                setattr(existing, field, data[field])
+                        to_update.append(existing)
+
+                if to_create:
+                    CompanySymbol.objects.bulk_create(
+                        to_create,
+                        batch_size=BATCH_SIZE,
+                    )
+                    created_count += len(to_create)
+
+                if to_update:
+                    CompanySymbol.objects.bulk_update(
+                        to_update,
+                        fields=UPDATE_FIELDS,
+                        batch_size=BATCH_SIZE,
+                    )
+                    updated_count += len(to_update)
+
+        processed = created_count + updated_count
+
+        return JsonResponse({
+            "success": f"{processed} records processed successfully.",
+            "created": created_count,
+            "updated": updated_count,
+            "skipped": len(invalid_rows),
+            "invalid_rows": invalid_rows,
+            "duplicate_symbols": duplicate_symbols,
+            "note": (
+                "Invalid rows need correction and re-import. "
+                "Duplicate symbols are consolidated using the last valid row."
+            ),
+        })
+
+    except Exception:
+        logger.exception("Company mapping import failed")
+        return JsonResponse(
+            {
+                "error": (
+                    "Import failed. Check the server logs for details."
+                )
+            },
+            status=500,
+        )
+
+import datetime
+import threading
+import os
+from django.conf import settings
+from django.http import JsonResponse
+from django.views.decorators.http import require_POST
+from .models import ErrorLog
+
+
+SCREENER_JOB_STATUS = {
+    "status": "idle",
+    "success": [],
+    "failed": [],
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
+
+
+@csrf_exempt
+@require_POST
+def start_screener_downloads(request):
+    """Start a background download for every company in CompanySymbol."""
+    from datetime import datetime
+    import re
+
+    global SCREENER_JOB_STATUS
+
+    if SCREENER_JOB_STATUS["status"] == "running":
+        return JsonResponse({
+            "status": "already_running",
+            "message": "A Screener download is already running.",
+        }, status=409)
+
+    companies = list(
+        CompanySymbol.objects
+        .order_by("name")
+        .values("symbol", "name", "company_name")
+    )
+
+    if not companies:
+        return JsonResponse({
+            "status": "error",
+            "message": "No companies were found in Company Mapping.",
+        }, status=400)
+
+    download_dir = os.path.join(settings.BASE_DIR, "screener_downloads")
+    os.makedirs(download_dir, exist_ok=True)
+
+    user_profile = os.getenv("CHROME_USER_DATA_DIR")
+    email = os.getenv("SCREENER_EMAIL")
+    password = os.getenv("SCREENER_PASSWORD")
+
+    SCREENER_JOB_STATUS.update({
+        "status": "running",
+        "success": [],
+        "failed": [],
+        "started_at": datetime.now().isoformat(),
+        "finished_at": None,
+        "error": None,
+        "total": len(companies),
+        "processed": 0,
+    })
+
+    def job():
+        global SCREENER_JOB_STATUS
+
+        try:
+            # The downloader currently accepts symbols, so retain that
+            # interface and use this mapping to restore company names.
+            company_by_symbol = {
+                item["symbol"].strip().upper(): item
+                for item in companies
+            }
+            symbols = [
+                item["symbol"].strip()
+                for item in companies
+                if item["symbol"] and item["symbol"].strip()
+            ]
+
+            result = download_for_symbols(
+                symbols=symbols,
+                download_dir=download_dir,
+                email=email,
+                password=password,
+                user_data_dir=user_profile,
+                headless=False,
+                delay_range=(6, 14),
+                per_download_timeout=90,
+            )
+
+            successes = result.get("success", [])
+            failures = result.get("failed", [])
+
+            for item in successes:
+                symbol = str(item.get("symbol", "")).strip().upper()
+                company = company_by_symbol.get(symbol, {})
+                item["company_name"] = (
+                    company.get("company_name")
+                    or company.get("name")
+                    or symbol
+                )
+
+            for item in failures:
+                symbol = str(item.get("symbol", "")).strip().upper()
+                company = company_by_symbol.get(symbol, {})
+                item["company_name"] = (
+                    company.get("company_name")
+                    or company.get("name")
+                    or symbol
+                )
+
+            SCREENER_JOB_STATUS.update({
+                "success": successes,
+                "failed": failures,
+                "processed": len(successes) + len(failures),
+            })
+
+            # If the downloader returned fewer results than requested,
+            # report the symbols it did not account for.
+            accounted_for = {
+                str(item.get("symbol", "")).strip().upper()
+                for item in successes + failures
+            }
+
+            for symbol in symbols:
+                key = symbol.strip().upper()
+                if key not in accounted_for:
+                    company = company_by_symbol.get(key, {})
+                    SCREENER_JOB_STATUS["failed"].append({
+                        "symbol": symbol,
+                        "company_name": (
+                            company.get("company_name")
+                            or company.get("name")
+                            or symbol
+                        ),
+                        "error": "The downloader did not return a result for this company.",
+                    })
+
+            SCREENER_JOB_STATUS["processed"] = (
+                len(SCREENER_JOB_STATUS["success"])
+                + len(SCREENER_JOB_STATUS["failed"])
+            )
+
+        except Exception as exc:
+            SCREENER_JOB_STATUS.update({
+                "status": "failed",
+                "error": str(exc),
+            })
+
+        finally:
+            SCREENER_JOB_STATUS["finished_at"] = datetime.now().isoformat()
+
+            if SCREENER_JOB_STATUS["status"] != "failed":
+                SCREENER_JOB_STATUS["status"] = "finished"
+
+    try:
+        threading.Thread(target=job, daemon=True).start()
+    except Exception as exc:
+        SCREENER_JOB_STATUS.update({
+            "status": "failed",
+            "error": str(exc),
+            "finished_at": datetime.now().isoformat(),
+        })
+        return JsonResponse({
+            "status": "error",
+            "message": str(exc),
+        }, status=500)
+
+    return JsonResponse({
+        "status": "started",
+        "total": len(companies),
+        "message": f"Download started for {len(companies)} mapped companies.",
+    })
+
+
+@csrf_exempt
+def screener_download_status(request):
+    """Return the current background-download status."""
+    return JsonResponse(SCREENER_JOB_STATUS)
+
+
+def get_screener_logs(request, symbols=None):
+    """
+    Return one row for every mapped company, including companies
+    that have not yet been downloaded.
+    """
+    import re
+
+    def normalize(value):
+        return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+    companies = list(
+        CompanySymbol.objects.order_by("name").values(
+            "symbol", "name", "company_name"
+        )
+    )
+
+    # Newest log first. The model does not currently store a symbol,
+    # so try matching each filename against the symbol and company names.
+    logs = list(ScreenerDownloadLog.objects.order_by("-download_date"))
+
+    if symbols is not None:
+        requested = {normalize(s) for s in symbols}
+        companies = [
+            c for c in companies
+            if normalize(c["symbol"]) in requested
+        ]
+
+    data = []
+
+    for company in companies:
+        symbol = company["symbol"]
+        company_name = company["company_name"] or company["name"] or symbol
+
+        possible_names = {
+            normalize(symbol),
+            normalize(company["name"]),
+            normalize(company["company_name"]),
+        }
+        possible_names.discard("")
+
+        matched_log = None
+
+        for log in logs:
+            filename_stem = normalize(
+                os.path.splitext(os.path.basename(log.file_name))[0]
+            )
+
+            if filename_stem in possible_names:
+                matched_log = log
+                break
+
+        if matched_log:
+            file_name = matched_log.file_name
+            file_path = matched_log.file_path
+            status = matched_log.status
+            date = matched_log.download_date.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            file_name = "—"
+            file_path = "—"
+            status = "NOT DOWNLOADED"
+            date = "—"
+
+        data.append({
+            "symbol": symbol,
+            "company_name": company_name,
+            "file_name": file_name,
+            "file_path": file_path,
+            "status": status,
+            "date": date,
+            "screener_url": (
+                f"https://www.screener.in/company/{symbol}/consolidated/"
+                if symbol
+                else None
+            ),
+        })
+
+    return JsonResponse({
+        "total": len(data),
+        "logs": data,
+    })
+
+from selenium import webdriver
+
+def get_chrome_driver(download_dir, user_data_dir=None, headless=False):
+    chrome_options = webdriver.ChromeOptions()
+
+    prefs = {
+        "download.default_directory": download_dir,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True,
+        # 👇 Most important: overwrite existing files
+        "download.manager.showWhenStarting": False,
+    }
+
+    chrome_options.add_experimental_option("prefs", prefs)
+
+    if user_data_dir:
+        chrome_options.add_argument(f"user-data-dir={user_data_dir}")
+    if headless:
+        chrome_options.add_argument("--headless=new")
+
+    return webdriver.Chrome(options=chrome_options)
+
+
+from .models import BalanceSheetYearValue
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from .models import BalanceSheetEntry, MetricSummary, MetricSummaryYearValue
+import numpy as np
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from .service import company_metrics
+from .service.company_metrics import YOY_TABLE_MAP
+import traceback
+import logging
+
+logger = logging.getLogger(__name__)
+import math
+import logging
+
+
+logger = logging.getLogger(__name__)
+
+
+class YearlyMetricsAPIView(APIView):
+    def get(self, request):
+        symbol = request.GET.get("symbol")
+
+        if not symbol:
+            return Response(
+                {"error": "Symbol required"},
+                status=400,
+            )
+
+        company = CompanySymbol.objects.filter(
+            symbol__iexact=symbol
+        ).first()
+
+        if not company:
+            return Response(
+                {"error": "Invalid symbol"},
+                status=404,
+            )
+
+        try:
+            er = int(request.GET.get("expected_return", 30))
+        except (ValueError, TypeError):
+            return Response(
+                {"error": "Invalid expected return"},
+                status=400,
+            )
+
+        if er not in YOY_TABLE_MAP:
+            return Response(
+                {"error": "Invalid expected return"},
+                status=400,
+            )
+
+        tables = YOY_TABLE_MAP[er]
+
+        equity = Equity.objects.select_related("company").filter(
+            company=company
+        ).first()
+
+        if not equity:
+            return Response(
+                {"error": "Equity record not found"},
+                status=404,
+            )
+
+        # --------------------------------------------------
+        # Query sources
+        # --------------------------------------------------
+        BalanceStats = tables["balance_stats"]
+
+        balance_stats_qs = BalanceStats.objects.filter(
+            company=company
+        )
+
+        pct_qs = MetricSummary.objects.filter(
+            company=company,
+            summary_type="pct_change",
+        )
+
+        balance_map = {
+            entry.type: entry
+            for entry in BalanceSheetEntry.objects.filter(
+                company=company
+            )
+        }
+
+        stats_map = {
+            item.base_type: item
+            for item in balance_stats_qs
+            if item.summary_type == "statistical"
+        }
+
+        pct_stats_map = {
+            item.base_type: item
+            for item in balance_stats_qs
+            if item.summary_type == "pct"
+        }
+
+        pct_map = {
+            item.base_type: item
+            for item in pct_qs
+        }
+
+        # --------------------------------------------------
+        # Value cleaning
+        # --------------------------------------------------
+        def clean(value):
+            if value is None:
+                return None
+
+            if isinstance(value, str):
+                value = value.strip()
+
+                if value.lower() in (
+                    "",
+                    "-",
+                    "missing",
+                    "na",
+                    "n/a",
+                    "none",
+                    "nan",
+                ):
+                    return None
+
+                value = value.replace(",", "").replace("%", "")
+
+            try:
+                number = float(value)
+                return number if math.isfinite(number) else None
+            except (ValueError, TypeError):
+                return None
+
+        # --------------------------------------------------
+        # Fetch year values
+        # --------------------------------------------------
+        years = list(
+            BalanceSheetYearValue.objects.filter(
+                entry__company=company
+            )
+            .values_list("year", flat=True)
+            .distinct()
+            .order_by("year")
+        )
+
+        year_value_qs = (
+            BalanceSheetYearValue.objects
+            .filter(entry__company=company)
+            .select_related("entry")
+            .order_by("year")
+        )
+
+        year_value_map = {}
+
+        for item in year_value_qs:
+            year_value_map[
+                (item.entry.type, item.year)
+            ] = clean(item.value)
+
+        # --------------------------------------------------
+        # Helper: calculate percentage change
+        # --------------------------------------------------
+        def calculate_pct_change(values):
+            result = []
+
+            for index, current in enumerate(values):
+                if index == 0:
+                    result.append(None)
+                    continue
+
+                previous = values[index - 1]
+
+                if (
+                    current is None
+                    or previous is None
+                    or previous == 0
+                ):
+                    result.append(None)
+                else:
+                    result.append(
+                        round(
+                            ((current - previous) / abs(previous)) * 100,
+                            2,
+                        )
+                    )
+
+            return result
+
+        # --------------------------------------------------
+        # Build original yearly metrics
+        # Sales, OPM, Net profit, EPS, ROE, ROCE
+        # --------------------------------------------------
+        metrics = [
+            "Sales",
+            "OPM",
+            "Net profit",
+            "EPS",
+            "ROE",
+            "ROCE",
+        ]
+
+        rows = []
+
+        for metric in metrics:
+            abs_stats = stats_map.get(metric)
+            pct_stats = pct_stats_map.get(metric)
+
+            values = [
+                year_value_map.get((metric, year))
+                for year in years
+            ]
+
+            entry = balance_map.get(metric)
+
+            trailing_value = (
+                clean(entry.trailing)
+                if entry
+                else None
+            )
+
+            # Preserve your existing rule for missing TTM ROE.
+            if metric == "ROE" and trailing_value is None:
+                trailing_value = 0.0
+
+            pct_values = calculate_pct_change(values)
+
+            # Compare TTM with the latest available annual value.
+            previous_value = next(
+                (
+                    value
+                    for value in reversed(values)
+                    if value is not None
+                ),
+                None,
+            )
+
+            if (
+                metric == "ROE"
+                and trailing_value == 0
+                and previous_value not in (None, 0)
+            ):
+                trailing_pct = -100.0
+
+            elif (
+                trailing_value is None
+                or previous_value is None
+                or previous_value == 0
+            ):
+                trailing_pct = None
+
+            else:
+                trailing_pct = round(
+                    (
+                        (trailing_value - previous_value)
+                        / abs(previous_value)
+                    ) * 100,
+                    2,
+                )
+
+            values_with_trailing = values + [trailing_value]
+            pct_values_with_trailing = pct_values + [trailing_pct]
+
+            # IMPORTANT: append every original metric row.
+            rows.append({
+                "key": metric,
+                "values": values,
+                "trailing": trailing_value,
+                "values_with_trailing": values_with_trailing,
+                "pct_values": pct_values,
+                "trailing_pct": trailing_pct,
+                "pct_values_with_trailing": pct_values_with_trailing,
+
+                "stats": {
+                    "10y": {
+                        "average": (
+                            abs_stats.ten_year_avg
+                            if abs_stats else None
+                        ),
+                        "median": (
+                            abs_stats.ten_year_median
+                            if abs_stats else None
+                        ),
+                        "trimmean": (
+                            abs_stats.ten_year_trimmean
+                            if abs_stats else None
+                        ),
+                    },
+                    "5y": {
+                        "average": (
+                            abs_stats.five_year_avg
+                            if abs_stats else None
+                        ),
+                        "median": (
+                            abs_stats.five_year_median
+                            if abs_stats else None
+                        ),
+                        "trimmean": (
+                            abs_stats.five_year_trimmean
+                            if abs_stats else None
+                        ),
+                    },
+                },
+
+                "pct_stats": {
+                    "10y": {
+                        "average": (
+                            pct_stats.ten_year_avg
+                            if pct_stats else None
+                        ),
+                        "median": (
+                            pct_stats.ten_year_median
+                            if pct_stats else None
+                        ),
+                        "trimmean": (
+                            pct_stats.ten_year_trimmean
+                            if pct_stats else None
+                        ),
+                    },
+                    "5y": {
+                        "average": (
+                            pct_stats.five_year_avg
+                            if pct_stats else None
+                        ),
+                        "median": (
+                            pct_stats.five_year_median
+                            if pct_stats else None
+                        ),
+                        "trimmean": (
+                            pct_stats.five_year_trimmean
+                            if pct_stats else None
+                        ),
+                    },
+                },
+            })
+
+        # --------------------------------------------------
+        # Calculate NPM and NPM change
+        # --------------------------------------------------
+        sales_values = [
+            year_value_map.get(("Sales", year))
+            for year in years
+        ]
+
+        net_profit_values = [
+            year_value_map.get(("Net profit", year))
+            for year in years
+        ]
+
+        npm_values = []
+
+        for sales, net_profit in zip(
+            sales_values,
+            net_profit_values,
+        ):
+            if (
+                sales is None
+                or net_profit is None
+                or sales == 0
+            ):
+                npm_values.append(None)
+            else:
+                npm_values.append(
+                    round((net_profit / sales) * 100, 2)
+                )
+
+        npm_change_values = calculate_pct_change(npm_values)
+
+        # Calculate TTM NPM from TTM sales and net profit.
+        sales_entry = balance_map.get("Sales")
+        net_profit_entry = balance_map.get("Net profit")
+
+        trailing_sales = (
+            clean(sales_entry.trailing)
+            if sales_entry else None
+        )
+
+        trailing_net_profit = (
+            clean(net_profit_entry.trailing)
+            if net_profit_entry else None
+        )
+
+        if (
+            trailing_sales is None
+            or trailing_net_profit is None
+            or trailing_sales == 0
+        ):
+            npm_trailing = None
+        else:
+            npm_trailing = round(
+                (trailing_net_profit / trailing_sales) * 100,
+                2,
+            )
+
+        last_npm = next(
+            (
+                value
+                for value in reversed(npm_values)
+                if value is not None
+            ),
+            None,
+        )
+
+        if (
+            npm_trailing is None
+            or last_npm is None
+            or last_npm == 0
+        ):
+            npm_trailing_change = None
+        else:
+            npm_trailing_change = round(
+                (
+                    (npm_trailing - last_npm)
+                    / abs(last_npm)
+                ) * 100,
+                2,
+            )
+
+        npm_values_with_trailing = npm_values + [npm_trailing]
+        npm_change_values_with_trailing = (
+            npm_change_values + [npm_trailing_change]
+        )
+
+        # --------------------------------------------------
+        # NPM statistical records
+        # --------------------------------------------------
+        npm_abs_stats = stats_map.get("NPM")
+        npm_pct_stats = pct_stats_map.get("NPM")
+
+        npm_change_abs_stats = stats_map.get("NPM change")
+
+        def get_period_stats(record, period):
+            if record is None:
+                return {
+                    "average": None,
+                    "median": None,
+                    "trimmean": None,
+                }
+
+            prefix = (
+                "ten_year"
+                if period == "10y"
+                else "five_year"
+            )
+
+            return {
+                "average": getattr(record, f"{prefix}_avg"),
+                "median": getattr(record, f"{prefix}_median"),
+                "trimmean": getattr(record, f"{prefix}_trimmean"),
+            }
+
+        npm_stats = {
+            "10y": get_period_stats(npm_abs_stats, "10y"),
+            "5y": get_period_stats(npm_abs_stats, "5y"),
+        }
+
+        npm_pct_stats_payload = {
+            "10y": get_period_stats(npm_pct_stats, "10y"),
+            "5y": get_period_stats(npm_pct_stats, "5y"),
+        }
+
+        npm_change_stats = {
+            "10y": get_period_stats(npm_change_abs_stats, "10y"),
+            "5y": get_period_stats(npm_change_abs_stats, "5y"),
+        }
+
+        # NPM is a calculated percentage-point value.
+        rows.append({
+            "key": "NPM",
+            "values": npm_values,
+            "trailing": npm_trailing,
+            "values_with_trailing": npm_values_with_trailing,
+            "pct_values": npm_change_values,
+            "trailing_pct": npm_trailing_change,
+            "pct_values_with_trailing": npm_change_values_with_trailing,
+            "stats": npm_stats,
+            "pct_stats": npm_pct_stats_payload,
+        })
+
+        # NPM change represents the year-on-year change in NPM.
+        rows.append({
+            "key": "NPM change",
+            "values": npm_change_values,
+            "trailing": npm_trailing_change,
+            "values_with_trailing": npm_change_values_with_trailing,
+            "pct_values": [None] * len(years) + [None],
+            "trailing_pct": None,
+            "pct_values_with_trailing": [None] * (len(years) + 1),
+            "stats": {
+                "10y": get_period_stats(npm_pct_stats, "10y"),
+                "5y": get_period_stats(npm_pct_stats, "5y"),
+            },
+            "pct_stats": {
+                "10y": get_period_stats(npm_pct_stats, "10y"),
+                "5y": get_period_stats(npm_pct_stats, "5y"),
+            },
+        })
+
+        # --------------------------------------------------
+        # Other existing sections
+        # --------------------------------------------------
+        summary_qs = tables["summary"].objects.filter(
+            company=company
+        )
+
+        growth_qs = tables["growth"].objects.filter(
+            company=company
+        )
+
+        VA10 = tables["value_10y"]
+        VA5 = tables["value_5y"]
+
+        return Response({
+            "company_info": {
+                "company_name": (
+                    equity.company.company_name
+                    or equity.company.name
+                ),
+                "symbol": equity.company.symbol,
+                "isin_number": equity.isin_number,
+                "sector": equity.company.sector,
+                "sub_sector_1": equity.company.sub_sector_1,
+                "sub_sector_2": equity.company.sub_sector_2,
+                "industry": equity.company.industry,
+            },
+
+            "yearly_table": {
+                "years": [
+                    (
+                        str(year)
+                        if year >= 1000
+                        else f"20{year:02d}"
+                    )
+                    for year in years
+                ] + ["TTM"],
+                "rows": rows,
+            },
+
+            "balance_stats": list(
+                balance_stats_qs.values(
+                    "base_type",
+                    "summary_type",
+                    "ten_year_avg",
+                    "ten_year_median",
+                    "ten_year_trimmean",
+                    "five_year_avg",
+                    "five_year_median",
+                    "five_year_trimmean",
+                )
+            ),
+
+            "value_analysis_10y": {
+                "trimmean": ValueAnalysis10YSerializer(
+                    VA10.objects.filter(
+                        company=company,
+                        stats_type="trimmean_10y",
+                    ).order_by("year"),
+                    many=True,
+                ).data,
+
+                "median": ValueAnalysis10YSerializer(
+                    VA10.objects.filter(
+                        company=company,
+                        stats_type="median_10y",
+                    ).order_by("year"),
+                    many=True,
+                ).data,
+
+                "average": ValueAnalysis10YSerializer(
+                    VA10.objects.filter(
+                        company=company,
+                        stats_type="average_10y",
+                    ).order_by("year"),
+                    many=True,
+                ).data,
+            },
+
+            "value_analysis_5y": {
+                "trimmean": ValueAnalysis5YSerializer(
+                    VA5.objects.filter(
+                        company=company,
+                        stats_type="trimmean_5y",
+                    ).order_by("year"),
+                    many=True,
+                ).data,
+
+                "median": ValueAnalysis5YSerializer(
+                    VA5.objects.filter(
+                        company=company,
+                        stats_type="median_5y",
+                    ).order_by("year"),
+                    many=True,
+                ).data,
+
+                "average": ValueAnalysis5YSerializer(
+                    VA5.objects.filter(
+                        company=company,
+                        stats_type="average_5y",
+                    ).order_by("year"),
+                    many=True,
+                ).data,
+            },
+
+            "growth": GrowthSummarySerializer.from_queryset(
+                growth_qs
+            ),
+
+            "final_analysis_table": FinalAnalysisTableSerializer(
+                tables["stock"].objects.filter(company=company),
+                many=True,
+            ).data,
+
+            "summary_conditions": SummaryConditionsSerializer.from_queryset(
+                summary_qs
+            ),
+        })
+
+class RecalculateAllCompaniesAPIView(APIView):
+    def post(self, request):
+        expected_return = float(request.data.get("expected_return", 30))
+        symbols = CompanySymbol.objects.all()
+
+        success = 0
+        failed = []
+
+        from django.db import transaction
+        
+        for company_symbol in symbols:
+            try:
+                print(f"Calculating {company_symbol.symbol}...")  # START log
+        
+                with transaction.atomic():
+                    company_metrics.calculate_metrics_engine(
+                        company_symbol,
+                        expected_return,
+                       
+                    )
+        
+                print(f"Done {company_symbol.symbol}")  # END log
+                success += 1
+        
+            except Exception as e:
+                print(f"Failed {company_symbol.symbol}: {e}")  # log error too
+                failed.append({
+                    "symbol": company_symbol.symbol,
+                    "error": str(e)
+                })
+                raise Exception("🔥 CALC ENDPOINT HIT 🔥")
+
+        return Response({
+            "status": "completed",
+            "success_count": success,
+            "failed_count": len(failed),
+            "failed": failed[:20],
+        })
+
+def calculate_metrics_for_company(company_symbol, expected_return=30):
+
+    models = company_metrics.YOY_TABLE_MAP.get(expected_return)
+    if not models:
+        raise ValueError(f"Unsupported expected_return: {expected_return}")
+
+    return company_metrics.calculate_metrics_engine(
+        company_symbol=company_symbol,
+        expected_return=expected_return,
+        models=models
+    )
+
+
+# ✅ Limit dropdown to 5 visible companies (scroll rest in frontend)
+def company_list_api(request):
+    companies = CompanySymbol.objects.all().values("name", "symbol")
+    return JsonResponse(list(companies), safe=False)
+
+
+# views.py
+from rest_framework import viewsets
+from .models import CompanySymbol
+from .serializers import CompanySymbolSerializer, FinalAnalysisTableSerializer, GrowthSummarySerializer, SummaryConditionsSerializer, ValueAnalysis10YSerializer, ValueAnalysis5YSerializer
+
+class CompanySymbolViewSet(viewsets.ModelViewSet):
+    queryset = CompanySymbol.objects.all()
+    serializer_class = CompanySymbolSerializer
+
+
+
+import json
+@csrf_exempt
+def update_mapping(request, symbol):
+    if request.method != "PUT":
+        return JsonResponse({"error": "Invalid request method"}, status=405)
+
+    data = json.loads(request.body.decode("utf-8"))
+    new_name = data.get("name", "").strip()
+
+    try:
+        obj = CompanySymbol.objects.get(symbol=symbol)
+        obj.name = new_name
+        obj.save()
+        return JsonResponse({"success": "Mapping updated successfully!"})
+    except CompanySymbol.DoesNotExist:
+        return JsonResponse({"error": "Mapping not found"}, status=404)
+
+
+@csrf_exempt
+def delete_mapping(request, symbol):
+    if request.method != "DELETE":
+        return JsonResponse({"error": "Invalid request method"}, status=405)
+
+    try:
+        CompanySymbol.objects.get(symbol=symbol).delete()
+        return JsonResponse({"success": "Mapping deleted successfully!"})
+    except CompanySymbol.DoesNotExist:
+        return JsonResponse({"error": "Mapping not found"}, status=404)
+
+
+@csrf_exempt
+def add_mapping(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "Invalid request method"}, status=405)
+
+    try:
+        data = json.loads(request.body.decode("utf-8"))
+        screener_file_name = data.get("name", "").strip()
+        symbol = data.get("symbol", "").strip()
+
+        if not screener_file_name or not symbol:
+            return JsonResponse({"error": "Both name and symbol are required"}, status=400)
+
+        CompanySymbol.objects.update_or_create(
+            symbol=symbol,
+            defaults={"name": screener_file_name}
+        )
+
+        return JsonResponse({"success": "Mapping added successfully!"})
+    except Exception as e:
+        return JsonResponse({"error": f"Failed to add mapping: {str(e)}"}, status=500)
+
+
+@api_view(['POST'])
+def import_nifty_index(request):
+    index_type = request.data.get("index_type")
+    file = request.FILES.get("file")
+
+    if not file or not index_type:
+        return Response({"error": "File and index_type are required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    df = pd.read_excel(file) if file.name.endswith('.xlsx') else pd.read_csv(file)
+
+    # ✅ Normalize column names
+    df.columns = df.columns.str.strip().str.lower()
+
+    if 'symbol' not in df.columns:
+        return Response({"error": f"Expected a column named 'symbol'. Found: {list(df.columns)}"}, status=400)
+
+    symbols = df['symbol'].dropna().unique()
+
+    updated, skipped = 0, 0
+    ''' for symbol in symbols:
+        try:
+            company = MCAPData.objects.get(symbol=symbol)
+            if company.nifty_index == "NONE":
+                company.nifty_index = index_type
+                company.save()
+                updated += 1
+            else:
+                skipped += 1
+        except MCAPData.DoesNotExist:
+            skipped += 1
+'''
+     
+    
+    for symbol in symbols:
+         try:
+             mcap = MCAPData.objects.get(company__symbol__iexact=symbol)  # Use company__symbol
+             if mcap.nifty_index == "NONE":
+                 mcap.nifty_index = index_type
+                 mcap.save()
+                 updated += 1
+             else:
+                 skipped += 1
+         except MCAPData.DoesNotExist:
+             skipped += 1
+     
+   
+    return Response({
+        "message": f"{updated} companies assigned to {index_type}.",
+        "updated": updated,
+        "skipped": skipped
+    }, status=status.HTTP_200_OK)
+
+
+from django.http import JsonResponse
+from balance.models import (
+    Equity,
+    MCAPData,
+    StockAnalysis,
+)
+
+
+from django.http import JsonResponse
+from .models import Equity, MCAPData
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ----------------------------
+# Helper functions
+# ----------------------------
+def normalize_symbol(symbol):
+    if not symbol:
+        return None
+    return symbol.strip().upper().replace(".NS", "")
+
+def normalize_valuation(val):
+    if not val:
+        return None
+    return val.strip().lower().replace(" ", "")
+
+# ----------------------------
+# Main view
+# ----------------------------
+from django.http import JsonResponse
+import logging
+
+logger = logging.getLogger(__name__)
+
+def normalize_valuation(val: str):
+    if not val:
+        return None
+    val = val.lower()
+    if "undervalued" in val:
+        return "undervalued"
+    if "overvalued" in val:
+        return "overvalued"
+    return None
+
+import re
+from django.http import JsonResponse
+
+
+def equities_with_mcap_filtered(request):
+    logger.info("Request received with params: %s", request.GET)
+
+    try:
+        expected_return = int(request.GET.get("expected_yoy", 30))
+    except (ValueError, TypeError):
+        expected_return = 30
+
+    requested_valuation = normalize_valuation(
+        request.GET.get("valuation")
+    )
+
+    if requested_valuation not in ("overvalued", "undervalued"):
+        requested_valuation = None
+
+    if expected_return not in YOY_TABLE_MAP:
+        expected_return = 30
+
+    StockModel = YOY_TABLE_MAP[expected_return]["stock"]
+    SummaryModel = YOY_TABLE_MAP[expected_return]["summary"]
+
+    # 1. Fetch equities and their companies in one query.
+    equities = list(
+        Equity.objects.select_related("company").all()
+    )
+
+    company_ids = {
+        eq.company_id
+        for eq in equities
+        if eq.company_id
+    }
+
+    # 2. Fetch market-cap records in bulk.
+    mcap_dict = {
+        normalize_symbol(m.company.symbol): m
+        for m in MCAPData.objects
+        .filter(company_id__in=company_ids)
+        .select_related("company")
+        if m.company and m.company.symbol
+    }
+
+    # 3. Fetch all valuation summaries in ONE query.
+    # Assumption: the first record means the lowest primary key.
+    valuation_dict = {}
+
+    summaries = (
+        SummaryModel.objects
+        .filter(
+            company_id__in=company_ids,
+            parameter="VALUATION",
+        )
+        .order_by("pk")
+        .values("company_id", "result")
+        .iterator(chunk_size=2000)
+    )
+
+    for item in summaries:
+        valuation_dict.setdefault(
+            item["company_id"], item["result"]
+        )
+
+    # 4. Fetch all target analyses in ONE query.
+    target_dict = {}
+
+    analyses = (
+        StockModel.objects
+        .filter(
+            company_id__in=company_ids,
+            analysis_tenure="TARGET",
+        )
+        .order_by("pk")
+        .values("company_id", "recommendation")
+        .iterator(chunk_size=2000)
+    )
+
+    for item in analyses:
+        target_dict.setdefault(
+            item["company_id"], item["recommendation"]
+        )
+
+    # 5. Build the response without database queries in the loop.
+    combined = []
+
+    for eq in equities:
+        company = eq.company
+
+        if not company or not company.symbol:
+            continue
+
+        symbol = normalize_symbol(company.symbol)
+        mcap = mcap_dict.get(symbol)
+
+        summary_result = valuation_dict.get(company.pk)
+
+        valuation_text = "Data not available"
+        derived_valuation = None
+
+        if summary_result:
+            valuation_text = summary_result.strip()
+            derived_valuation = normalize_valuation(
+                valuation_text
+            )
+
+        if (
+            requested_valuation
+            and derived_valuation != requested_valuation
+        ):
+            continue
+
+        recommendation = target_dict.get(company.pk)
+        target_price = None
+
+        if recommendation:
+            match = re.search(
+                r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)",
+                recommendation,
+            )
+
+            if match:
+                try:
+                    target_price = float(match.group())
+                except (ValueError, TypeError):
+                    pass
+
+        combined.append({
+            "id": eq.id,
+            "symbol": symbol,
+            "valuation": valuation_text,
+            "share_price": getattr(mcap, "share_price", None),
+            "market_cap": getattr(mcap, "market_cap", None),
+            "company_size": getattr(mcap, "company_size", None),
+            "company_name": company.company_name or company.name,
+            "sector": company.sector,
+            "sub_sector_1": company.sub_sector_1,
+            "sub_sector_2": company.sub_sector_2,
+            "industry": company.industry,
+            "target_price": target_price,
+        })
+
+    logger.info("Returning %d companies", len(combined))
+
+    return JsonResponse(combined, safe=False)
+
+from django.db.models import Count
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+
+from .service.company_metrics import YOY_TABLE_MAP
+
+
+@api_view(["GET"])
+def industry_valuation_stats(request):
+    """
+    Industry-wise Overvalued / Undervalued count
+    (Uses ONLY CompanySymbol.industry)
+    """
+
+    expected_yoy = int(request.GET.get("expected_yoy", 30))
+
+    if expected_yoy not in YOY_TABLE_MAP:
+        return Response({"error": "Invalid expected_yoy"}, status=400)
+
+    SummaryModel = YOY_TABLE_MAP[expected_yoy]["summary"]
+
+    qs = (
+        SummaryModel.objects
+        .select_related("company")
+        .filter(
+            parameter="VALUATION",
+            company__industry__isnull=False
+        )
+    )
+
+    total_overvalued = qs.filter(result__iexact="overvalued").count()
+    total_undervalued = qs.filter(result__iexact="undervalued").count()
+
+    industry_rows = (
+        qs.values(
+            "company__industry",
+            "result"
+        )
+        .annotate(count=Count("id"))
+    )
+
+    industry_map = {}
+
+    for row in industry_rows:
+        industry = row["company__industry"].strip()
+        valuation = row["result"].lower()
+        count = row["count"]
+
+        if industry not in industry_map:
+            industry_map[industry] = {
+                "overvalued": 0,
+                "undervalued": 0,
+                "total": 0,
+            }
+
+        if valuation in ("overvalued", "undervalued"):
+            industry_map[industry][valuation] += count
+            industry_map[industry]["total"] += count
+
+    industries = []
+    for industry, v in industry_map.items():
+        total = v["total"]
+
+        if total == 0:
+            over_pct = 0
+            under_pct = 0
+        else:
+            over_pct = round(v["overvalued"] * 100 / total, 2)
+            under_pct = round(v["undervalued"] * 100 / total, 2)
+    
+        industries.append({
+            "industry": industry,
+            "overvalued": v["overvalued"],
+            "undervalued": v["undervalued"],
+                "overvalued_pct": over_pct,
+                "undervalued_pct": under_pct,
+            })
+    
+    return Response({
+        "summary": {
+            "overvalued": total_overvalued,
+            "undervalued": total_undervalued,
+            "expected_yoy": expected_yoy,
+        },
+        "industries": industries,
+    })
+
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+from rest_framework import status
+
+from balance.models import ErrorLog
+from balance.serializers import ErrorLogSerializer
+
+
+ERROR_CHOICES_MAP = {
+    "Missing in NSC": "MISSING_EQUITY",
+    "Missing in mapping": "MISSING_COMPANY_SYMBOL",
+    "Calculation failed": "CALCULATION_FAILED",
+    "Screener download failed": "SCREENER_DOWNLOAD_FAILED",
+    "Missing TTM P/E": "NULL_TTM_PE",
+    "Missing Stock P/E": "NULL_STOCK_PE",
+    "Missing Industry P/E": "NULL_INDUSTRY_PE",
+}
+
+
+@api_view(["GET"])
+def error_logs_api(request):
+    frontend_label = request.query_params.get("error_type")
+
+    # Never display successful calculations as errors.
+    queryset = ErrorLog.objects.exclude(
+        error_type="CALCULATION_SUCCESS"
+    )
+
+    if frontend_label:
+        error_type = ERROR_CHOICES_MAP.get(frontend_label)
+
+        if not error_type:
+            return Response(
+                {"error": f"Unknown error type: {frontend_label}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if frontend_label == "Calculation failed":
+            queryset = queryset.filter(
+                error_type__in=[
+                    "CALCULATION_FAILED",
+                    "PE_CALCULATION_FAILED",
+                ]
+            )
+        else:
+            queryset = queryset.filter(error_type=error_type)
+
+    queryset = queryset.order_by("-created_at")
+
+    serializer = ErrorLogSerializer(queryset, many=True)
+    return Response(serializer.data)
+
+
+
+# ============================================================
+# Screener Excel formula recalculation
+# ============================================================
+
+EXCEL_RECALCULATION_STATUS = {
+    "status": "idle",
+    "total": 0,
+    "processed": 0,
+    "current_file": None,
+    "success": [],
+    "failed": [],
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+}
+
+EXCEL_RECALCULATION_LOCK = threading.Lock()
+
+
+
+@csrf_exempt
+@require_POST
+def start_screener_excel_recalculation(request):
+    """Start recalculation and persist per-file results in the database."""
+    import os
+    import threading
+    import uuid
+
+    from django.conf import settings
+    from django.http import JsonResponse
+    from django.utils import timezone
+
+    from .models import CompanySymbol, ExcelRecalculationLog
+
+    global EXCEL_RECALCULATION_STATUS
+
+    download_dir = os.path.join(settings.BASE_DIR, "screener_downloads")
+    run_started_at = timezone.now()
+    run_id = uuid.uuid4()
+
+    with EXCEL_RECALCULATION_LOCK:
+        if EXCEL_RECALCULATION_STATUS["status"] == "running":
+            return JsonResponse(
+                {
+                    "status": "already_running",
+                    "message": "Excel recalculation is already running.",
+                },
+                status=409,
+            )
+
+        if not os.path.isdir(download_dir):
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": (
+                        "The Screener download folder does not exist: "
+                        + download_dir
+                    ),
+                },
+                status=400,
+            )
+
+        EXCEL_RECALCULATION_STATUS = {
+            "status": "running",
+            "total": 0,
+            "processed": 0,
+            "current_file": None,
+            "success": [],
+            "failed": [],
+            "started_at": run_started_at.isoformat(),
+            "finished_at": None,
+            "error": None,
+            "run_id": str(run_id),
+        }
+
+    def job():
+        global EXCEL_RECALCULATION_STATUS
+
+        try:
+            from .excel_recalculator import recalculate_excel_files
+
+            def update_progress(processed, total, current_file):
+                EXCEL_RECALCULATION_STATUS.update({
+                    "processed": processed,
+                    "total": total,
+                    "current_file": current_file,
+                })
+
+            result = recalculate_excel_files(
+                folder_path=download_dir,
+                progress_callback=update_progress,
+            )
+
+            run_finished_at = timezone.now()
+
+            # Match Excel filename stems to CompanySymbol.name,
+            # ignoring capitalization and surrounding whitespace.
+            company_map = {
+                company.name.strip().casefold(): company
+                for company in CompanySymbol.objects.all()
+                if company.name
+            }
+
+            log_records = []
+
+            for item in result.get("success", []):
+                file_name = item["file"]
+                company_key = os.path.splitext(file_name)[0].strip().casefold()
+
+                log_records.append(
+                    ExcelRecalculationLog(
+                        run_id=run_id,
+                        company=company_map.get(company_key),
+                        file_name=file_name,
+                        file_path=os.path.join(download_dir, file_name),
+                        status="success",
+                        error="",
+                        run_started_at=run_started_at,
+                        run_finished_at=run_finished_at,
+                    )
+                )
+
+            for item in result.get("failed", []):
+                file_name = item["file"]
+                company_key = os.path.splitext(file_name)[0].strip().casefold()
+
+                log_records.append(
+                    ExcelRecalculationLog(
+                        run_id=run_id,
+                        company=company_map.get(company_key),
+                        file_name=file_name,
+                        file_path=os.path.join(download_dir, file_name),
+                        status="failed",
+                        error=item.get("error", "Unknown error"),
+                        run_started_at=run_started_at,
+                        run_finished_at=run_finished_at,
+                    )
+                )
+
+            # Bulk insert all results from this run.
+            if log_records:
+                ExcelRecalculationLog.objects.bulk_create(log_records)
+
+            EXCEL_RECALCULATION_STATUS.update({
+                "total": result["total"],
+                "processed": result["processed"],
+                "success": result["success"],
+                "failed": result["failed"],
+                "status": (
+                    "finished_with_errors"
+                    if result["failed"]
+                    else "finished"
+                ),
+                "finished_at": run_finished_at.isoformat(),
+            })
+
+        except Exception as exc:
+            EXCEL_RECALCULATION_STATUS.update({
+                "status": "failed",
+                "error": str(exc),
+                "finished_at": timezone.now().isoformat(),
+            })
+
+        finally:
+            EXCEL_RECALCULATION_STATUS.update({
+                "current_file": None,
+            })
+
+    try:
+        threading.Thread(
+            target=job,
+            name="ScreenerExcelRecalculation",
+            daemon=True,
+        ).start()
+
+    except Exception as exc:
+        EXCEL_RECALCULATION_STATUS.update({
+            "status": "failed",
+            "error": str(exc),
+            "finished_at": timezone.now().isoformat(),
+        })
+
+        return JsonResponse(
+            {"status": "error", "message": str(exc)},
+            status=500,
+        )
+
+    return JsonResponse({
+        "status": "started",
+        "message": "Excel recalculation has started.",
+        "run_id": str(run_id),
+    })
+
+
+@csrf_exempt
+def screener_excel_recalculation_status(request):
+    """Return current Excel recalculation progress and results."""
+    return JsonResponse(EXCEL_RECALCULATION_STATUS)
+
+
+@require_GET
+def screener_excel_recalculation_logs(request):
+    """Return saved Excel recalculation history."""
+    from .models import ExcelRecalculationLog
+
+    logs = ExcelRecalculationLog.objects.select_related("company").order_by(
+        "-created_at"
+    )
+
+    status_filter = request.GET.get("status", "").strip().lower()
+    search = request.GET.get("search", "").strip()
+
+    if status_filter in ("success", "failed"):
+        logs = logs.filter(status=status_filter)
+
+    if search:
+        from django.db.models import Q
+
+        logs = logs.filter(
+            Q(file_name__icontains=search)
+            | Q(company__name__icontains=search)
+            | Q(company__company_name__icontains=search)
+            | Q(company__symbol__icontains=search)
+            | Q(error__icontains=search)
+        )
+
+    logs = logs[:500]
+
+    return JsonResponse({
+        "count": len(logs),
+        "results": [
+            {
+                "id": log.id,
+                "run_id": str(log.run_id),
+                "company_name": log.company.name if log.company else None,
+                "company_symbol": log.company.symbol if log.company else None,
+                "file_name": log.file_name,
+                "file_path": log.file_path,
+                "status": log.status,
+                "error": log.error,
+                "run_started_at": (
+                    log.run_started_at.isoformat()
+                    if log.run_started_at else None
+                ),
+                "run_finished_at": (
+                    log.run_finished_at.isoformat()
+                    if log.run_finished_at else None
+                ),
+                "created_at": log.created_at.isoformat(),
+            }
+            for log in logs
+        ],
+    })
+

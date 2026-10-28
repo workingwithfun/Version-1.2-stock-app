@@ -1,0 +1,123 @@
+﻿
+import os
+import pythoncom
+import win32com.client
+
+
+EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xlsb"}
+
+
+def recalculate_excel_files(folder_path, progress_callback=None):
+    """
+    Recalculate Excel workbooks in one folder using desktop Microsoft Excel.
+
+    Does not bypass Protected View or disable Excel security settings.
+    """
+    if not os.path.isdir(folder_path):
+        raise FileNotFoundError(
+            f"Excel download folder does not exist: {folder_path}"
+        )
+
+    files = sorted(
+        os.path.join(folder_path, name)
+        for name in os.listdir(folder_path)
+        if os.path.splitext(name)[1].lower() in EXCEL_EXTENSIONS
+        and not name.startswith("~$")
+        and os.path.isfile(os.path.join(folder_path, name))
+    )
+
+    results = {
+        "total": len(files),
+        "processed": 0,
+        "success": [],
+        "failed": [],
+    }
+
+    if not files:
+        return results
+
+    pythoncom.CoInitialize()
+    excel = None
+
+    try:
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.Visible = True
+        excel.DisplayAlerts = False
+        excel.AskToUpdateLinks = False
+        excel.EnableEvents = False
+
+        # Excel constant: xlCalculationAutomatic = -4105
+        excel.Calculation = -4105
+
+        for index, file_path in enumerate(files, start=1):
+            file_name = os.path.basename(file_path)
+            workbook = None
+
+            try:
+                if progress_callback:
+                    progress_callback(
+                        index - 1,
+                        len(files),
+                        file_name,
+                    )
+
+                workbook = excel.Workbooks.Open(
+                    os.path.abspath(file_path),
+                    UpdateLinks=0,
+                    ReadOnly=False,
+                    IgnoreReadOnlyRecommended=True,
+                    Notify=False,
+                    AddToMru=False,
+                )
+
+                if workbook.ReadOnly:
+                    raise PermissionError(
+                        "Excel opened this workbook as read-only. "
+                        "Check file permissions or whether another program "
+                        "has locked the file."
+                    )
+
+                # Rebuild formula dependencies and recalculate formulas.
+                excel.CalculateFullRebuild()
+                excel.CalculateUntilAsyncQueriesDone()
+                workbook.Save()
+
+                results["success"].append({
+                    "file": file_name,
+                    "message": "Recalculated and saved.",
+                })
+
+            except Exception as exc:
+                results["failed"].append({
+                    "file": file_name,
+                    "error": str(exc),
+                })
+
+            finally:
+                if workbook is not None:
+                    try:
+                        workbook.Close(SaveChanges=False)
+                    except Exception:
+                        pass
+
+                results["processed"] += 1
+
+                if progress_callback:
+                    progress_callback(
+                        results["processed"],
+                        len(files),
+                        file_name,
+                    )
+
+    finally:
+        if excel is not None:
+            try:
+                excel.EnableEvents = True
+                excel.Quit()
+            except Exception:
+                pass
+
+        pythoncom.CoUninitialize()
+
+    return results
+
