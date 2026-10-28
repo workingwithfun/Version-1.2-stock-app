@@ -1,0 +1,31 @@
+.container {
+  padding: 20px;
+  font-family: Arial, sans-serif;
+}
+
+.controls {
+  margin-bottom: 12px;
+}
+
+.table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th, td {
+  border: 1px solid #ddd;
+  padding: 6px 8px;
+  font-size: 14px;
+  text-align: left;
+}
+
+th {
+  background: #f4f4f4;
+  position: sticky;
+  top: 0;
+}
